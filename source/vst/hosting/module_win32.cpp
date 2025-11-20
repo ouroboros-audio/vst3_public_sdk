@@ -392,6 +392,16 @@ void addToPathList (Module::PathList& pathList, const std::string& toAdd)
 	pathList.push_back (toAdd);
 }
 
+// Bridge char8_t paths emitted by generic_u8string().
+void addToPathList (Module::PathList& pathList, const std::u8string& toAdd)
+{
+	std::string ascii;
+	ascii.reserve (toAdd.size ());
+	for (auto ch : toAdd)
+		ascii.push_back (static_cast<char> (ch));
+	addToPathList (pathList, ascii);
+}
+
 //------------------------------------------------------------------------
 void findFilesWithExt (const filesystem::path& path, const std::string& ext,
                        Module::PathList& pathList, bool recursive = true)
