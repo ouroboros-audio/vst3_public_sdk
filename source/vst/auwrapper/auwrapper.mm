@@ -229,9 +229,15 @@ public:
 			//--- -----------------------
 			case 2: channelLayout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo; break;
 			//--- -----------------------
+			case 4: channelLayout.mChannelLayoutTag = kAudioChannelLayoutTag_AudioUnit_4; break;
+			//--- -----------------------
 			case 6: channelLayout.mChannelLayoutTag = kAudioChannelLayoutTag_AudioUnit_5_1; break;
 			//--- -----------------------
-			default: return kAudioUnitErr_InvalidProperty;
+			default:
+				if (numChannels <= 0)
+					return kAudioUnitErr_InvalidProperty;
+				channelLayout.mChannelLayoutTag = kAudioChannelLayoutTag_DiscreteInOrder | static_cast<uint32> (numChannels);
+				break;
 		}
 		return noErr;
 	}
@@ -774,9 +780,36 @@ static SpeakerArrangement numChannelsToSpeakerArrangement (UInt32 numChannels)
 		//--- -----------------------
 		case 2: return SpeakerArr::kStereo;
 		//--- -----------------------
+		case 4: return SpeakerArr::k40Music;
+		//--- -----------------------
 		case 6: return SpeakerArr::k51;
 	}
-	return 0;
+
+	// Provide a stable ordering for "discrete" channels beyond the standard arrangements.
+	// We list all known non-ambisonic speakers first, then ambisonic ACN channels, then fall back to
+	// unnamed bits to reach 64 channels (SpeakerArrangement is a 64-bit bitset).
+	const Speaker speakers[] = {
+		// Basic bed
+		kSpeakerL, kSpeakerR, kSpeakerC, kSpeakerLfe, kSpeakerLs, kSpeakerRs, kSpeakerLc, kSpeakerRc, kSpeakerSl, kSpeakerSr, kSpeakerCs, kSpeakerLfe2, kSpeakerM,
+		// Height / top
+		kSpeakerTc, kSpeakerTfl, kSpeakerTfc, kSpeakerTfr, kSpeakerTsl, kSpeakerTsr, kSpeakerTrl, kSpeakerTrc, kSpeakerTrr,
+		// Rear/side variants
+		kSpeakerLcs, kSpeakerRcs, kSpeakerLw, kSpeakerRw,
+		// Bottom layer
+		kSpeakerBfl, kSpeakerBfc, kSpeakerBfr, kSpeakerBsl, kSpeakerBsr, kSpeakerBrl, kSpeakerBrc, kSpeakerBrr,
+		// Proximity
+		kSpeakerPl, kSpeakerPr,
+		// Ambisonics (ACN)
+		kSpeakerACN0, kSpeakerACN1, kSpeakerACN2, kSpeakerACN3, kSpeakerACN4, kSpeakerACN5, kSpeakerACN6, kSpeakerACN7, kSpeakerACN8, kSpeakerACN9, kSpeakerACN10, kSpeakerACN11, kSpeakerACN12, kSpeakerACN13, kSpeakerACN14, kSpeakerACN15, kSpeakerACN16, kSpeakerACN17, kSpeakerACN18, kSpeakerACN19, kSpeakerACN20, kSpeakerACN21, kSpeakerACN22, kSpeakerACN23, kSpeakerACN24,
+		// Remaining unnamed bits (61-63)
+		static_cast<Speaker> (1ULL << 61), static_cast<Speaker> (1ULL << 62), static_cast<Speaker> (1ULL << 63)};
+
+	SpeakerArrangement arrangement = 0;
+	const int maxSpeakers = static_cast<int> (sizeof (speakers) / sizeof (speakers[0]));
+	const int count = static_cast<int> (std::min<UInt32> (numChannels, static_cast<UInt32> (maxSpeakers)));
+	for (int i = 0; i < count; ++i)
+		arrangement |= speakers[i];
+	return arrangement;
 }
 
 //------------------------------------------------------------------------
