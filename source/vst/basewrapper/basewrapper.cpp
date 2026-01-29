@@ -1348,6 +1348,11 @@ void BaseWrapper::onTimer (Timer*)
 	if (!mController)
 		return;
 
+	if (mProcessorConnection)
+		mProcessorConnection->flushPending ();
+	if (mControllerConnection)
+		mControllerConnection->flushPending ();
+
 	ParamID id;
 	ParamValue value;
 	int32 sampleOffset;

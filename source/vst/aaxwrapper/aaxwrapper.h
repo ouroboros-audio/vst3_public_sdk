@@ -20,6 +20,8 @@
 
 #include "public.sdk/source/vst/basewrapper/basewrapper.h"
 #include "base/thread/include/flock.h"
+#include "pluginterfaces/vst/iwebview_aaxhostextensions.h"
+#include <atomic>
 #include <bitset>
 #include <list>
 #include <memory>
@@ -46,7 +48,8 @@ struct AAXWrapper_Context
 //------------------------------------------------------------------------
 class AAXWrapper : public Steinberg::Vst::BaseWrapper,
                    public Steinberg::Vst::IComponentHandler2,
-                   public Steinberg::Vst::IVst3ToAAXWrapper
+                   public Steinberg::Vst::IVst3ToAAXWrapper,
+                   public Steinberg::Vst::IWebViewAAXHostExtensions
 {
 public:
 	// static creation method (will owned factory)
@@ -75,8 +78,15 @@ public:
 	Steinberg::tresult PLUGIN_API startGroupEdit () SMTG_OVERRIDE;
 	Steinberg::tresult PLUGIN_API finishGroupEdit () SMTG_OVERRIDE;
 
+	// IWebViewAAXHostExtensions
+	Steinberg::tresult PLUGIN_API openAutomationMenu (Steinberg::Vst::ParamID paramId) SMTG_OVERRIDE;
+	Steinberg::tresult PLUGIN_API openAutomationLane (Steinberg::Vst::ParamID paramId) SMTG_OVERRIDE;
+	Steinberg::tresult PLUGIN_API beginMultiMonoLink (Steinberg::Vst::ParamID paramId) SMTG_OVERRIDE;
+	Steinberg::tresult PLUGIN_API endMultiMonoLink (Steinberg::Vst::ParamID paramId) SMTG_OVERRIDE;
+
 	// FUnknown
-	DEF_INTERFACES_2 (Steinberg::Vst::IComponentHandler2, Steinberg::Vst::IVst3ToAAXWrapper, BaseWrapper);
+	DEF_INTERFACES_3 (Steinberg::Vst::IComponentHandler2, Steinberg::Vst::IVst3ToAAXWrapper,
+	                   Steinberg::Vst::IWebViewAAXHostExtensions, BaseWrapper);
 	REFCOUNT_METHODS (BaseWrapper);
 
 	// AAXWrapper_Parameters callbacks
@@ -170,6 +180,18 @@ private:
 	bool mPresetChanged = false;
 	bool mBypassBeforePresetChanged = false;
 	bool mWantsSetChunkIsPreset = false;
+
+	// Latency updates can be requested by the wrapped VST3 instance from a non-main thread.
+	// Pro Tools appears to require SetSignalLatency on the main thread, so we defer it to onTimer.
+	std::atomic<Steinberg::int32> pendingSignalLatency {-1};
+	// Cached last-seen latency from the wrapped VST3 instance so the wrapper can detect changes
+	// even if the host ignores/doesn't route kLatencyChanged restarts.
+	std::atomic<Steinberg::int32> lastObservedSignalLatency {-1};
+
+	std::atomic<Steinberg::Vst::ParamID> pendingAutomationMenuParamId {Steinberg::Vst::kNoParamId};
+	std::atomic<Steinberg::Vst::ParamID> pendingAutomationLaneParamId {Steinberg::Vst::kNoParamId};
+	std::atomic<Steinberg::Vst::ParamID> pendingMultiMonoLinkDownParamId {Steinberg::Vst::kNoParamId};
+	std::atomic<Steinberg::Vst::ParamID> pendingMultiMonoLinkUpParamId {Steinberg::Vst::kNoParamId};
 
 	friend class AAXWrapper_Parameters;
 	friend class AAXWrapper_GUI;
