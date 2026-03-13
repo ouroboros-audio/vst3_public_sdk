@@ -28,6 +28,9 @@
 #include "AAX_IMIDINode.h"
 #include "AAX_IPropertyMap.h"
 #include "AAX_IViewContainer.h"
+#include "pluginterfaces/vst/ivstmidicontrollers.h"
+
+#include <algorithm>
 #include "AAX_Version.h"
 
 static_assert (AAX_SDK_CURRENT_REVISION >= AAX_SDK_2p3p2_REVISION,
@@ -1089,45 +1092,52 @@ Steinberg::int32 AAXWrapper::Process (AAXWrapper_Context* instance)
 	AAX_ASSERT (bufferSize <= 1024);
 
 	uint32 cntMidiPorts = getNumMIDIports ();
-	for (uint32 m = 0; m < cntMidiPorts; m++)
+	if (mPluginDesc->mMIDIports)
 	{
-		auto* midiNode = static_cast<AAX_IMIDINode*> (instance->ptr[idxMidiPorts + m]);
-		AAX_CMidiStream* midiBuffer = midiNode->GetNodeBuffer ();
-		if (!midiBuffer)
-			continue;
-
-		//- Check incoming MIDI packets ()
-		//
-		for (uint32_t i = 0; i < midiBuffer->mBufferSize; i++)
+		uint32 portIndex = 0;
+		for (AAX_MIDI_Desc* midiDesc = mPluginDesc->mMIDIports; midiDesc->mName && portIndex < cntMidiPorts;
+		     ++midiDesc, ++portIndex)
 		{
-			AAX_CMidiPacket& buf = midiBuffer->mBuffer[i];
-			if (buf.mLength > 0)
-			{
-				const uint8 status = static_cast<uint8> (buf.mData[0] & Vst::kStatusMask);
-				uint32 requiredLength = 1;
-				switch (status)
-				{
-					case kNoteOn:
-					case kNoteOff:
-					case kPolyPressure:
-					case kController:
-					case kPitchBendStatus: requiredLength = 3; break;
-					case kAfterTouchStatus:
-					case kProgramChangeStatus: requiredLength = 2; break;
-					default: requiredLength = 1; break;
-				}
-				if (buf.mLength < requiredLength)
-					continue;
+			if (midiDesc->mType != AAX_eMIDINodeType_LocalInput)
+				continue;
+			auto* midiNode = static_cast<AAX_IMIDINode*> (instance->ptr[idxMidiPorts + portIndex]);
+			AAX_CMidiStream* midiBuffer = midiNode->GetNodeBuffer ();
+			if (!midiBuffer)
+				continue;
 
-				// skip note-on events if bypassed to reduce processor load for instruments,
-				// but let everything else through to avoid hanging notes
-				if (mSimulateBypass && mBypass)
-					if (status == Vst::kNoteOn && buf.mData[2] != 0)
+			//- Check incoming MIDI packets ()
+			//
+			for (uint32_t i = 0; i < midiBuffer->mBufferSize; i++)
+			{
+				AAX_CMidiPacket& buf = midiBuffer->mBuffer[i];
+				if (buf.mLength > 0)
+				{
+					const uint8 status = static_cast<uint8> (buf.mData[0] & Vst::kStatusMask);
+					uint32 requiredLength = 1;
+					switch (status)
+					{
+						case kNoteOn:
+						case kNoteOff:
+						case kPolyPressure:
+						case kController:
+						case kPitchBendStatus: requiredLength = 3; break;
+						case kAfterTouchStatus:
+						case kProgramChangeStatus: requiredLength = 2; break;
+						default: requiredLength = 1; break;
+					}
+					if (buf.mLength < requiredLength)
 						continue;
 
-				Event toAdd = {static_cast<int32> (m), static_cast<int32> (buf.mTimestamp), 0};
-				bool isLive = buf.mIsImmediate || buf.mTimestamp == 0;
-				processMidiEvent (toAdd, (char*)&buf.mData[0], isLive);
+					// skip note-on events if bypassed to reduce processor load for instruments,
+					// but let everything else through to avoid hanging notes
+					if (mSimulateBypass && mBypass)
+						if (status == Vst::kNoteOn && buf.mData[2] != 0)
+							continue;
+
+					Event toAdd = {static_cast<int32> (portIndex), static_cast<int32> (buf.mTimestamp), 0};
+					bool isLive = buf.mIsImmediate || buf.mTimestamp == 0;
+					processMidiEvent (toAdd, (char*)&buf.mData[0], isLive);
+				}
 			}
 		}
 	}
@@ -1151,15 +1161,17 @@ Steinberg::int32 AAXWrapper::Process (AAXWrapper_Context* instance)
 	}
 
 	// First output
-	float** const AAX_RESTRICT pdO = static_cast<float**> (instance->ptr[idxOutputChannels]);
-	if (pdO == nullptr)
-		return AAX_ERROR_NULL_ARGUMENT;
-
 	uint32 cntOut = getNumOutputs ();
 	uint32 aaxOut = getNumAAXOutputs ();
-	float* outputs[maxActiveChannels];
+	float* outputs[maxActiveChannels] = {};
+	float silentOutput[1024] = {};
+	float** const AAX_RESTRICT pdO =
+	    idxOutputChannels >= 0 ? static_cast<float**> (instance->ptr[idxOutputChannels]) : nullptr;
+	if (pdO == nullptr && aaxOut > 0)
+		return AAX_ERROR_NULL_ARGUMENT;
+
 	uint32 mainOuts = static_cast<uint32> (mPluginDesc->mOutputChannels);
-	if (mainOuts == 6)
+	if (pdO && mainOuts == 6)
 	{
 		// sort Surround channels from AAX (L C R Ls Rs LFE) to VST (L R C LFE Ls Rs)
 		outputs[0] = pdO[0];
@@ -1172,7 +1184,7 @@ Steinberg::int32 AAXWrapper::Process (AAXWrapper_Context* instance)
 	else
 		mainOuts = 0;
 	for (uint32 i = mainOuts; i < aaxOut; i++)
-		outputs[i] = pdO[i];
+		outputs[i] = pdO ? pdO[i] : silentOutput;
 	float buf[1024];
 	for (uint32 i = aaxOut; i < cntOut; i++)
 		outputs[i] = buf;
@@ -1180,7 +1192,9 @@ Steinberg::int32 AAXWrapper::Process (AAXWrapper_Context* instance)
 
 	mMetersTmp = (mCntMeters > 0) ? *static_cast<float**> (instance->ptr[idxMeters]) : nullptr;
 
+	mCurrentProcessInstance = instance;
 	_processReplacing (pdI, outputs, bufferSize);
+	mCurrentProcessInstance = nullptr;
 
 	mMetersTmp = nullptr;
 
@@ -1216,6 +1230,108 @@ Steinberg::int32 AAXWrapper::Process (AAXWrapper_Context* instance)
 	}
 
 	return AAX_SUCCESS;
+}
+
+//------------------------------------------------------------------------
+void AAXWrapper::processOutputEvents ()
+{
+	if (!mOutputEvents)
+		return;
+	if (!mCurrentProcessInstance || !mPluginDesc || !mPluginDesc->mMIDIports)
+	{
+		mOutputEvents->clear ();
+		return;
+	}
+
+	const int32 count = mOutputEvents->getEventCount ();
+	if (count <= 0)
+	{
+		mOutputEvents->clear ();
+		return;
+	}
+
+	uint32 portIndex = 0;
+	for (AAX_MIDI_Desc* mdesc = mPluginDesc->mMIDIports; mdesc->mName; ++mdesc, ++portIndex)
+	{
+		if (mdesc->mType != AAX_eMIDINodeType_LocalOutput)
+			continue;
+
+		auto* midiNode = static_cast<AAX_IMIDINode*> (mCurrentProcessInstance->ptr[idxMidiPorts + portIndex]);
+		if (!midiNode)
+			continue;
+
+		for (int32 i = 0; i < count; ++i)
+		{
+			Steinberg::Vst::Event event {};
+			if (mOutputEvents->getEvent (i, event) != kResultTrue)
+				continue;
+
+			AAX_CMidiPacket packet {};
+			packet.mIsImmediate = false;
+			packet.mTimestamp = static_cast<uint32_t> (std::max<int32> (0, event.sampleOffset));
+
+			switch (event.type)
+			{
+				case Steinberg::Vst::Event::kNoteOnEvent:
+					packet.mLength = 3;
+					packet.mData[0] = static_cast<uint8> (0x90 | (event.noteOn.channel & 0x0F));
+					packet.mData[1] = static_cast<uint8> (event.noteOn.pitch & 0x7F);
+					packet.mData[2] = static_cast<uint8> (std::max (0, std::min (127, static_cast<int32> (event.noteOn.velocity * 127.f + 0.5f))));
+					break;
+				case Steinberg::Vst::Event::kNoteOffEvent:
+					packet.mLength = 3;
+					packet.mData[0] = static_cast<uint8> (0x80 | (event.noteOff.channel & 0x0F));
+					packet.mData[1] = static_cast<uint8> (event.noteOff.pitch & 0x7F);
+					packet.mData[2] = static_cast<uint8> (std::max (0, std::min (127, static_cast<int32> (event.noteOff.velocity * 127.f + 0.5f))));
+					break;
+				case Steinberg::Vst::Event::kPolyPressureEvent:
+					packet.mLength = 3;
+					packet.mData[0] = static_cast<uint8> (0xA0 | (event.polyPressure.channel & 0x0F));
+					packet.mData[1] = static_cast<uint8> (event.polyPressure.pitch & 0x7F);
+					packet.mData[2] = static_cast<uint8> (std::max (0, std::min (127, static_cast<int32> (event.polyPressure.pressure * 127.f + 0.5f))));
+					break;
+				case Steinberg::Vst::Event::kLegacyMIDICCOutEvent:
+				{
+					const auto statusNibble = [&]() -> uint8
+					{
+						switch (event.midiCCOut.controlNumber)
+						{
+							case Steinberg::Vst::kCtrlProgramChange: return 0xC0;
+							case Steinberg::Vst::kAfterTouch: return 0xD0;
+							case Steinberg::Vst::kPitchBend: return 0xE0;
+							default: return 0xB0;
+						}
+					}();
+
+					packet.mData[0] = static_cast<uint8> (statusNibble | (event.midiCCOut.channel & 0x0F));
+					if (statusNibble == 0xC0 || statusNibble == 0xD0)
+					{
+						packet.mLength = 2;
+						packet.mData[1] = static_cast<uint8> (event.midiCCOut.value & 0x7F);
+					}
+					else if (statusNibble == 0xE0)
+					{
+						packet.mLength = 3;
+						packet.mData[1] = static_cast<uint8> (event.midiCCOut.value & 0x7F);
+						packet.mData[2] = static_cast<uint8> (event.midiCCOut.value2 & 0x7F);
+					}
+					else
+					{
+						packet.mLength = 3;
+						packet.mData[1] = static_cast<uint8> (event.midiCCOut.controlNumber & 0x7F);
+						packet.mData[2] = static_cast<uint8> (event.midiCCOut.value & 0x7F);
+					}
+					break;
+				}
+				default:
+					continue;
+			}
+
+			midiNode->PostMIDIPacket (&packet);
+		}
+	}
+
+	mOutputEvents->clear ();
 }
 
 //------------------------------------------------------------------------
@@ -1308,6 +1424,9 @@ static uint32 vst3Category2AAXPlugInCategory (const char* cat)
 {
 	static const uint32 PDA_ePlugInCategory_Effect =
 	    AAX_ePlugInCategory_None; // does not exist anymore?
+
+	if (strstr (cat, "MIDIEffect") != nullptr)
+		return AAX_EPlugInCategory_MIDIEffect;
 
 	uint32 result = AAX_ePlugInCategory_None;
 
@@ -1402,7 +1521,7 @@ void AAXWrapper::DescribeAlgorithmComponent (AAX_IComponentDescriptor* outDesc,
 	{
 		for (AAX_MIDI_Desc* mdesc = pdesc->mMIDIports; mdesc->mName; mdesc++)
 		{
-			err = outDesc->AddMIDINode (idx++, AAX_eMIDINodeType_LocalInput, mdesc->mName,
+			err = outDesc->AddMIDINode (idx++, mdesc->mType, mdesc->mName,
 			                            mdesc->mMask);
 			AAX_ASSERT (err == 0);
 		}
@@ -1453,6 +1572,12 @@ void AAXWrapper::DescribeAlgorithmComponent (AAX_IComponentDescriptor* outDesc,
 	properties->AddProperty (AAX_eProperty_CanBypass, true);
 	properties->AddProperty (AAX_eProperty_LatencyContribution,
 	                         static_cast<AAX_CPropertyValue> (pdesc->mLatency));
+	if (strstr (desc->mCategory, "MIDIEffect") != nullptr)
+	{
+		properties->AddProperty (AAX_eProperty_Constraint_MultiMonoSupport, false);
+		properties->AddProperty (AAX_eProperty_Constraint_AlwaysProcess, true);
+		properties->AddProperty (AAX_eProperty_ObservesTransportState, true);
+	}
 	// properties->AddProperty (AAX_eProperty_UsesClientGUI, true); // Uses auto-GUI
 
 	//

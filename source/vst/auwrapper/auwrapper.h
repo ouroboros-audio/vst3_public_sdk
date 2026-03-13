@@ -261,6 +261,9 @@ protected:
 	bool isInstrument;
 	bool isBypassed;
 	bool isOfflineRender;
+#if AUSDK_MIDI2_AVAILABLE
+	SInt32 hostMIDIProtocol;
+#endif
 
 private:
 	void buildUnitInfos (IUnitInfo* unitInfoController, UnitInfoMap& units) const;

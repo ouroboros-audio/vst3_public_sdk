@@ -19,6 +19,7 @@
 #pragma once
 
 #include "base/source/fstring.h"
+#include "AAX_Enums.h"
 
 using namespace Steinberg;
 
@@ -40,6 +41,7 @@ struct AAX_MIDI_Desc
 {
 	const char* mName;
 	uint32 mMask;
+	AAX_EMIDINodeType mType;
 };
 
 struct AAX_Plugin_Desc

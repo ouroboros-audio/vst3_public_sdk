@@ -124,6 +124,7 @@ public:
 //------------------------------------------------------------------------
 private:
 	void processOutputParametersChanges () SMTG_OVERRIDE;
+	void processOutputEvents () SMTG_OVERRIDE;
 	
 	Steinberg::tresult setupBusArrangements (AAX_Plugin_Desc* desc);
 	Steinberg::int32 countSidechainBusChannels (Steinberg::Vst::BusDirection dir,
@@ -134,6 +135,7 @@ private:
 
 	AAXWrapper_Parameters* mAAXParams = nullptr;
 	AAXWrapper_GUI* mAAXGUI = nullptr;
+	AAXWrapper_Context* mCurrentProcessInstance = nullptr;
 
 	Steinberg::uint32 mAAXOutputs = 0;
 
