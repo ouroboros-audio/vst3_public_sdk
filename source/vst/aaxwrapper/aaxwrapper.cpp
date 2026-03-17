@@ -1276,19 +1276,25 @@ void AAXWrapper::processOutputEvents ()
 					packet.mLength = 3;
 					packet.mData[0] = static_cast<uint8> (0x90 | (event.noteOn.channel & 0x0F));
 					packet.mData[1] = static_cast<uint8> (event.noteOn.pitch & 0x7F);
-					packet.mData[2] = static_cast<uint8> (std::max (0, std::min (127, static_cast<int32> (event.noteOn.velocity * 127.f + 0.5f))));
+					packet.mData[2] = static_cast<uint8> (
+					    std::clamp (static_cast<int32> (event.noteOn.velocity * 127.f + 0.5f), 0,
+					                127));
 					break;
 				case Steinberg::Vst::Event::kNoteOffEvent:
 					packet.mLength = 3;
 					packet.mData[0] = static_cast<uint8> (0x80 | (event.noteOff.channel & 0x0F));
 					packet.mData[1] = static_cast<uint8> (event.noteOff.pitch & 0x7F);
-					packet.mData[2] = static_cast<uint8> (std::max (0, std::min (127, static_cast<int32> (event.noteOff.velocity * 127.f + 0.5f))));
+					packet.mData[2] = static_cast<uint8> (
+					    std::clamp (static_cast<int32> (event.noteOff.velocity * 127.f + 0.5f), 0,
+					                127));
 					break;
 				case Steinberg::Vst::Event::kPolyPressureEvent:
 					packet.mLength = 3;
 					packet.mData[0] = static_cast<uint8> (0xA0 | (event.polyPressure.channel & 0x0F));
 					packet.mData[1] = static_cast<uint8> (event.polyPressure.pitch & 0x7F);
-					packet.mData[2] = static_cast<uint8> (std::max (0, std::min (127, static_cast<int32> (event.polyPressure.pressure * 127.f + 0.5f))));
+					packet.mData[2] = static_cast<uint8> (
+					    std::clamp (static_cast<int32> (event.polyPressure.pressure * 127.f + 0.5f),
+					                0, 127));
 					break;
 				case Steinberg::Vst::Event::kLegacyMIDICCOutEvent:
 				{
