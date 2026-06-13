@@ -19,6 +19,10 @@
 #include "pluginterfaces/vst/ivstmessage.h"
 #include "public.sdk/source/common/threadchecker.h"
 
+#include <atomic>
+#include <deque>
+#include <mutex>
+
 namespace Steinberg {
 namespace Vst {
 
@@ -38,6 +42,8 @@ public:
 	tresult PLUGIN_API notify (IMessage* message) override;
 
 	bool disconnect ();
+	void flushPending ();
+	void scheduleFlush ();
 
 //------------------------------------------------------------------------
 	DECLARE_FUNKNOWN_METHODS
@@ -46,6 +52,12 @@ protected:
 
 	IPtr<IConnectionPoint> srcConnection;
 	IPtr<IConnectionPoint> dstConnection;
+
+	static constexpr std::size_t kMaxPendingMessages = 256;
+	std::mutex pendingMutex;
+	std::deque<IPtr<IMessage>> pendingMessages;
+	std::atomic<bool> pendingOverflow {false};
+	std::atomic<bool> flushScheduled {false};
 };
 }
 } // namespaces

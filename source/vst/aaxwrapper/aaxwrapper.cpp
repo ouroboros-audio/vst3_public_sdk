@@ -27,6 +27,7 @@
 #include "AAX_IEffectDescriptor.h"
 #include "AAX_IMIDINode.h"
 #include "AAX_IPropertyMap.h"
+#include "AAX_IViewContainer.h"
 #include "AAX_Version.h"
 
 static_assert (AAX_SDK_CURRENT_REVISION >= AAX_SDK_2p3p2_REVISION,
@@ -39,6 +40,8 @@ static_assert (AAX_SDK_CURRENT_REVISION >= AAX_SDK_2p3p2_REVISION,
 #include "base/thread/include/fcondition.h"
 
 #include "pluginterfaces/base/funknownimpl.h"
+
+#include <cstdio>
 
 #define USE_TRACE 1
 
@@ -247,6 +250,124 @@ tresult PLUGIN_API AAXWrapper::finishGroupEdit ()
 }
 
 //------------------------------------------------------------------------
+tresult PLUGIN_API AAXWrapper::openAutomationMenu (ParamID paramId)
+{
+	// Pro Tools expects this call on the main/UI thread. When invoked from some other thread
+	// (e.g. the wrapped plug-in), defer it to onTimer (main thread).
+	if (mainThread != getCurrentThread ())
+	{
+		pendingAutomationMenuParamId.store (paramId, std::memory_order_relaxed);
+		return kResultTrue;
+	}
+
+	if (!mAAXGUI)
+		return kResultFalse;
+
+	FGuard guard (mSyncCalls);
+
+	AAX_IViewContainer* vc = mAAXGUI ? mAAXGUI->GetViewContainer () : nullptr;
+	if (!vc)
+		return kResultFalse;
+
+	// Pro Tools automation menu gesture:
+	// Mac: Cmd+Opt+Ctrl+Click
+	// Win: Ctrl+Alt+Start+Click
+	constexpr uint32_t kAutomationMenuMods =
+	    static_cast<uint32_t> (AAX_eModifiers_Control | AAX_eModifiers_Option | AAX_eModifiers_Command);
+
+	AAX_CID aaxid (paramId);
+	const AAX_Result downResult = vc->HandleParameterMouseDown (aaxid, kAutomationMenuMods);
+	if (downResult != AAX_SUCCESS)
+		return kResultFalse;
+
+	vc->HandleParameterMouseUp (aaxid, kAutomationMenuMods);
+	return kResultTrue;
+}
+
+//------------------------------------------------------------------------
+tresult PLUGIN_API AAXWrapper::openAutomationLane (ParamID paramId)
+{
+	// Pro Tools expects this call on the main/UI thread.
+	if (mainThread != getCurrentThread ())
+	{
+		pendingAutomationLaneParamId.store (paramId, std::memory_order_relaxed);
+		return kResultTrue;
+	}
+
+	if (!mAAXGUI)
+		return kResultFalse;
+
+	FGuard guard (mSyncCalls);
+
+	AAX_IViewContainer* vc = mAAXGUI ? mAAXGUI->GetViewContainer () : nullptr;
+	if (!vc)
+		return kResultFalse;
+
+	// Pro Tools automation lane gesture:
+	// Mac: Cmd+Ctrl+Click
+	// Win: Ctrl+Start+Click
+	constexpr uint32_t kAutomationLaneMods =
+	    static_cast<uint32_t> (AAX_eModifiers_Control | AAX_eModifiers_Command);
+
+	AAX_CID aaxid (paramId);
+	const AAX_Result downResult = vc->HandleParameterMouseDown (aaxid, kAutomationLaneMods);
+	if (downResult != AAX_SUCCESS)
+		return kResultFalse;
+
+	vc->HandleParameterMouseUp (aaxid, kAutomationLaneMods);
+	return kResultTrue;
+}
+
+//------------------------------------------------------------------------
+tresult PLUGIN_API AAXWrapper::beginMultiMonoLink (ParamID paramId)
+{
+	// This needs to happen immediately (before parameter edits) to be useful.
+	if (mainThread != getCurrentThread ())
+	{
+		pendingMultiMonoLinkDownParamId.store (paramId, std::memory_order_relaxed);
+		return kResultTrue;
+	}
+
+	if (!mAAXGUI)
+		return kResultFalse;
+
+	FGuard guard (mSyncCalls);
+
+	AAX_IViewContainer* vc = mAAXGUI ? mAAXGUI->GetViewContainer () : nullptr;
+	if (!vc)
+		return kResultFalse;
+
+	constexpr uint32_t kMods = static_cast<uint32_t> (AAX_eModifiers_Shift);
+	AAX_CID aaxid (paramId);
+	const AAX_Result downResult = vc->HandleParameterMouseDown (aaxid, kMods);
+	return downResult == AAX_SUCCESS ? kResultTrue : kResultFalse;
+}
+
+//------------------------------------------------------------------------
+tresult PLUGIN_API AAXWrapper::endMultiMonoLink (ParamID paramId)
+{
+	if (mainThread != getCurrentThread ())
+	{
+		pendingMultiMonoLinkUpParamId.store (paramId, std::memory_order_relaxed);
+		return kResultTrue;
+	}
+
+	if (!mAAXGUI)
+		return kResultFalse;
+
+	FGuard guard (mSyncCalls);
+
+	AAX_IViewContainer* vc = mAAXGUI ? mAAXGUI->GetViewContainer () : nullptr;
+	if (!vc)
+		return kResultFalse;
+
+	constexpr uint32_t kMods = static_cast<uint32_t> (AAX_eModifiers_Shift);
+	AAX_CID aaxid (paramId);
+	const AAX_Result upResult = vc->HandleParameterMouseUp (aaxid, kMods);
+	return upResult == AAX_SUCCESS ? kResultTrue : kResultFalse;
+}
+
+//------------------------------------------------------------------------
 bool AAXWrapper::init ()
 {
 	bool res = BaseWrapper::init ();
@@ -438,6 +559,54 @@ void AAXWrapper::onTimer (Timer* timer)
 	BaseWrapper::onTimer (timer);
 
 	AAX_ASSERT (mainThread == getCurrentThread ());
+
+	const Steinberg::Vst::ParamID pendingAutomationMenu =
+	    pendingAutomationMenuParamId.exchange (Steinberg::Vst::kNoParamId, std::memory_order_relaxed);
+	if (pendingAutomationMenu != Steinberg::Vst::kNoParamId)
+		openAutomationMenu (pendingAutomationMenu);
+
+	const Steinberg::Vst::ParamID pendingAutomationLane =
+	    pendingAutomationLaneParamId.exchange (Steinberg::Vst::kNoParamId, std::memory_order_relaxed);
+	if (pendingAutomationLane != Steinberg::Vst::kNoParamId)
+		openAutomationLane (pendingAutomationLane);
+
+	const Steinberg::Vst::ParamID pendingMultiMonoLinkDown =
+	    pendingMultiMonoLinkDownParamId.exchange (Steinberg::Vst::kNoParamId, std::memory_order_relaxed);
+	if (pendingMultiMonoLinkDown != Steinberg::Vst::kNoParamId)
+		beginMultiMonoLink (pendingMultiMonoLinkDown);
+
+	const Steinberg::Vst::ParamID pendingMultiMonoLinkUp =
+	    pendingMultiMonoLinkUpParamId.exchange (Steinberg::Vst::kNoParamId, std::memory_order_relaxed);
+	if (pendingMultiMonoLinkUp != Steinberg::Vst::kNoParamId)
+		endMultiMonoLink (pendingMultiMonoLinkUp);
+
+	// Pro Tools can miss (or delay) VST3 kLatencyChanged restarts. Poll the wrapped processor's
+	// latency here (main thread) and translate any changes into an AAX SetSignalLatency call.
+	if (mProcessor)
+	{
+		const Steinberg::int32 currentLatency =
+		    static_cast<Steinberg::int32> (mProcessor->getLatencySamples ());
+		const Steinberg::int32 prevLatency =
+		    lastObservedSignalLatency.exchange (currentLatency, std::memory_order_relaxed);
+		if (currentLatency >= 0 && currentLatency != prevLatency)
+			pendingSignalLatency.store (currentLatency, std::memory_order_relaxed);
+	}
+
+	const Steinberg::int32 pendingLatency =
+	    pendingSignalLatency.exchange (-1, std::memory_order_relaxed);
+	if (pendingLatency >= 0)
+	{
+		AAX_IController* ctrler = mAAXParams ? mAAXParams->Controller () : nullptr;
+		if (ctrler)
+		{
+			const int32_t aaxResult = ctrler->SetSignalLatency (static_cast<int32_t> (pendingLatency));
+			(void)aaxResult;
+		}
+		else
+		{
+			pendingSignalLatency.store (pendingLatency, std::memory_order_relaxed);
+		}
+	}
 
 	if (mWantsSetChunk && !mSettingChunk)
 	{
@@ -640,7 +809,9 @@ AAXWrapper* AAXWrapper::create (IPluginFactory* factory, const TUID vst3Componen
 {
 	// mostly a copy of BaseWrapper::create
 	if (!factory)
+	{
 		return nullptr;
+	}
 
 	BaseWrapper::SVST3Config config;
 	config.processor = nullptr;
@@ -650,7 +821,9 @@ AAXWrapper* AAXWrapper::create (IPluginFactory* factory, const TUID vst3Componen
 
 	factory->createInstance (vst3ComponentID, IAudioProcessor::iid, (void**)&config.processor);
 	if (!config.processor)
+	{
 		return nullptr;
+	}
 
 	config.controller = nullptr;
 	if (config.processor->queryInterface (IEditController::iid, (void**)&config.controller) !=
@@ -669,7 +842,13 @@ AAXWrapper* AAXWrapper::create (IPluginFactory* factory, const TUID vst3Componen
 	config.vst3ComponentID = FUID::fromTUID (vst3ComponentID);
 
 	auto* wrapper = NEW AAXWrapper (config, params, desc);
-	if (wrapper->init () == false || wrapper->setupBusArrangements (desc) != kResultOk)
+	if (wrapper->init () == false)
+	{
+		wrapper->release ();
+		return nullptr;
+	}
+	const auto busResult = wrapper->setupBusArrangements (desc);
+	if (busResult != kResultOk)
 	{
 		wrapper->release ();
 		return nullptr;
@@ -914,6 +1093,8 @@ Steinberg::int32 AAXWrapper::Process (AAXWrapper_Context* instance)
 	{
 		auto* midiNode = static_cast<AAX_IMIDINode*> (instance->ptr[idxMidiPorts + m]);
 		AAX_CMidiStream* midiBuffer = midiNode->GetNodeBuffer ();
+		if (!midiBuffer)
+			continue;
 
 		//- Check incoming MIDI packets ()
 		//
@@ -922,10 +1103,26 @@ Steinberg::int32 AAXWrapper::Process (AAXWrapper_Context* instance)
 			AAX_CMidiPacket& buf = midiBuffer->mBuffer[i];
 			if (buf.mLength > 0)
 			{
+				const uint8 status = static_cast<uint8> (buf.mData[0] & Vst::kStatusMask);
+				uint32 requiredLength = 1;
+				switch (status)
+				{
+					case kNoteOn:
+					case kNoteOff:
+					case kPolyPressure:
+					case kController:
+					case kPitchBendStatus: requiredLength = 3; break;
+					case kAfterTouchStatus:
+					case kProgramChangeStatus: requiredLength = 2; break;
+					default: requiredLength = 1; break;
+				}
+				if (buf.mLength < requiredLength)
+					continue;
+
 				// skip note-on events if bypassed to reduce processor load for instruments,
 				// but let everything else through to avoid hanging notes
 				if (mSimulateBypass && mBypass)
-					if ((buf.mData[0] & Vst::kStatusMask) == Vst::kNoteOn && buf.mData[2] != 0)
+					if (status == Vst::kNoteOn && buf.mData[2] != 0)
 						continue;
 
 				Event toAdd = {static_cast<int32> (m), static_cast<int32> (buf.mTimestamp), 0};
@@ -1055,16 +1252,32 @@ void AAXWrapper::processOutputParametersChanges ()
 //-----------------------------------------------------------------------------
 Steinberg::tresult PLUGIN_API AAXWrapper::restartComponent (Steinberg::int32 flags)
 {
+	const bool onMainThread = (mainThread == getCurrentThread ());
+
 	tresult result = BaseWrapper::restartComponent (flags);
 
 	//--- ----------------------
 	if (flags & kLatencyChanged)
 	{
-		if (mAAXParams && mProcessor)
+		const Steinberg::int32 latency =
+		    mProcessor ? static_cast<Steinberg::int32> (mProcessor->getLatencySamples ()) : 0;
+		pendingSignalLatency.store (latency, std::memory_order_relaxed);
+
+		// Pro Tools appears to ignore latency changes if SetSignalLatency is called off the main
+		// thread. We always defer to onTimer (main thread), and also apply immediately when safe.
+		if (onMainThread)
 		{
-			AAX_IController* ctrler = mAAXParams->Controller ();
+			const Steinberg::int32 pending = pendingSignalLatency.exchange (-1, std::memory_order_relaxed);
+			AAX_IController* ctrler = mAAXParams ? mAAXParams->Controller () : nullptr;
 			if (ctrler)
-				ctrler->SetSignalLatency (static_cast<int32_t> (mProcessor->getLatencySamples ()));
+			{
+				const int32_t aaxResult = ctrler->SetSignalLatency (static_cast<int32_t> (pending));
+				(void)aaxResult;
+			}
+			else
+			{
+				pendingSignalLatency.store (pending, std::memory_order_relaxed);
+			}
 		}
 		result = kResultTrue;
 	}

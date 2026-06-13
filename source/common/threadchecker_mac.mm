@@ -31,7 +31,16 @@ class MacThreadChecker : public ThreadChecker
 public:
 	bool test (const char* failmessage = nullptr, bool exit = false) override
 	{
-		if (threadID == pthread_self ())
+		// VST3's ConnectionProxy uses this to decide whether messages can be delivered
+		// immediately or must be queued/flushed on the UI/main thread.
+		//
+		// In AAX hosts, ConnectionProxy can be constructed on a non-main thread during
+		// plug-in instantiation, which would cause the original "capture pthread_self()"
+		// logic to treat that thread as the "UI thread" and permanently block message
+		// delivery via the main run loop.
+		//
+		// On macOS we instead key off the actual process main thread.
+		if (pthread_main_np ())
 			return true;
 		if (failmessage)
 			NSLog (@"%s", failmessage);
@@ -39,8 +48,6 @@ public:
 			std::terminate ();
 		return false;
 	}
-
-	pthread_t threadID {pthread_self ()};
 };
 
 //------------------------------------------------------------------------
