@@ -183,6 +183,9 @@ struct AUWrapper::MIDIOutputCallbackHelper
 	~MIDIOutputCallbackHelper ();
 
 	void setCallbackInfo (AUMIDIOutputCallback callback, void* userData);
+#if AUSDK_MIDI2_AVAILABLE
+	void setEventListCallback (AUMIDIEventListBlock callback);
+#endif
 	void addEvent (UInt8 status, UInt8 channel, UInt8 data1, UInt8 data2, UInt32 inStartFrame);
 	void fireAtTimeStamp (const AudioTimeStamp& inTimeStamp);
 
@@ -203,6 +206,9 @@ private:
 	std::array<Byte, 1024> mBuffersAllocated;
 	AUMIDIOutputCallbackStruct mMIDICallbackStruct;
 	MIDIMessageList mMIDIMessageList;
+#if AUSDK_MIDI2_AVAILABLE
+	AUMIDIEventListBlock mMIDIEventListCallback;
+#endif
 };
 
 #ifdef SMTG_AUWRAPPER_USES_AUSDK
@@ -436,6 +442,9 @@ AUWrapper::AUWrapper (ComponentInstanceRecord* ci)
 , paramListenerRef (nullptr)
 , midiOutCount (0)
 , isOfflineRender (false)
+#if AUSDK_MIDI2_AVAILABLE
+, hostMIDIProtocol (MIDIProtocolID::kMIDIProtocol_1_0)
+#endif
 {
 	FUNKNOWN_CTOR
 	AutoreleasePool ap;
@@ -1706,6 +1715,30 @@ OSStatus AUWrapper::GetPropertyInfo (AudioUnitPropertyID inID, AudioUnitScope in
 		}
 #if AUSDK_MIDI2_AVAILABLE
 		//--- -----------------------
+		case kAudioUnitProperty_MIDIOutputEventListCallback:
+		{
+			if (inScope == kAudioUnitScope_Global && midiOutCount > 0)
+			{
+				outDataSize = sizeof (AUMIDIEventListBlock);
+				outWritable = true;
+				return noErr;
+			}
+			break;
+		}
+#endif
+#if AUSDK_MIDI2_AVAILABLE
+		//--- -----------------------
+		case kAudioUnitProperty_HostMIDIProtocol:
+		{
+			if (inScope == kAudioUnitScope_Global)
+			{
+				outDataSize = sizeof (SInt32);
+				outWritable = true;
+				return noErr;
+			}
+			return kAudioUnitErr_InvalidProperty;
+		}
+		//--- -----------------------
 		case kAudioUnitProperty_AudioUnitMIDIProtocol:
 		{
 			if (inScope == kAudioUnitScope_Global)
@@ -1790,6 +1823,35 @@ ComponentResult AUWrapper::SetProperty (AudioUnitPropertyID inID, AudioUnitScope
 			}
 			break;
 		}
+#if AUSDK_MIDI2_AVAILABLE
+		//--- -----------------------
+		case kAudioUnitProperty_MIDIOutputEventListCallback:
+		{
+			if (inScope == kAudioUnitScope_Global && midiOutCount > 0)
+			{
+				if (inDataSize != sizeof (AUMIDIEventListBlock))
+					return kAudioUnitErr_InvalidPropertyValue;
+				mCallbackHelper->setEventListCallback (
+				    *static_cast<const AUMIDIEventListBlock*> (inData));
+				return noErr;
+			}
+			break;
+		}
+#endif
+#if AUSDK_MIDI2_AVAILABLE
+		//--- -----------------------
+		case kAudioUnitProperty_HostMIDIProtocol:
+		{
+			if (inScope == kAudioUnitScope_Global)
+			{
+				if (inDataSize != sizeof (SInt32))
+					return kAudioUnitErr_InvalidPropertyValue;
+				hostMIDIProtocol = *static_cast<const SInt32*> (inData);
+				return noErr;
+			}
+			return kAudioUnitErr_InvalidProperty;
+		}
+#endif
 		//--- -----------------------
 		case kAudioUnitProperty_OfflineRender:
 		{
@@ -1969,7 +2031,7 @@ ComponentResult AUWrapper::GetProperty (AudioUnitPropertyID inID, AudioUnitScope
 		{
 			if (inScope == kAudioUnitScope_Global)
 			{
-				*reinterpret_cast<SInt32*>(outData) = MIDIProtocolID::kMIDIProtocol_2_0;
+				*reinterpret_cast<SInt32*>(outData) = MIDIProtocolID::kMIDIProtocol_1_0;
 				return noErr;
 			}
 			return kAudioUnitErr_InvalidProperty;
@@ -2306,6 +2368,18 @@ bool AUWrapper::handleMIDIEventPacket (UInt32 inOffsetSampleFrame, const MIDIEve
 			e.sampleOffset = sampleOffset;
 			w.eventList.addEvent (e);
 		}
+		void onMidi1NoteOn (Group group, Channel channel, NoteNumber note,
+		                    Velocity8 velocity) const override
+		{
+			Event e = {};
+			e.type = Event::kNoteOnEvent;
+			e.noteOn.channel = channel;
+			e.noteOn.pitch = note;
+			e.noteOn.velocity = velocity / 127.f;
+			e.noteOn.noteId = note;
+			e.sampleOffset = sampleOffset;
+			w.eventList.addEvent (e);
+		}
 		void onNoteOff (Group group, Channel channel, NoteNumber note, Velocity16 velocity,
 		                AttributeType attr, AttributeValue attrValue) const override
 		{
@@ -2319,6 +2393,18 @@ bool AUWrapper::handleMIDIEventPacket (UInt32 inOffsetSampleFrame, const MIDIEve
 			e.sampleOffset = sampleOffset;
 			w.eventList.addEvent (e);
 		}
+		void onMidi1NoteOff (Group group, Channel channel, NoteNumber note,
+		                     Velocity8 velocity) const override
+		{
+			Event e = {};
+			e.type = Event::kNoteOffEvent;
+			e.noteOff.channel = channel;
+			e.noteOff.pitch = note;
+			e.noteOff.velocity = velocity / 127.f;
+			e.noteOff.noteId = note;
+			e.sampleOffset = sampleOffset;
+			w.eventList.addEvent (e);
+		}
 		void onPolyPressure (Group group, Channel channel, NoteNumber note,
 		                     Data32 data) const override
 		{
@@ -2328,6 +2414,17 @@ bool AUWrapper::handleMIDIEventPacket (UInt32 inOffsetSampleFrame, const MIDIEve
 			e.polyPressure.pitch = note;
 			e.polyPressure.pressure =
 			    data / static_cast<float> (std::numeric_limits<Data32>::max ());
+			e.sampleOffset = sampleOffset;
+			w.eventList.addEvent (e);
+		}
+		void onMidi1PolyPressure (Group group, Channel channel, NoteNumber note,
+		                          Data8 data) const override
+		{
+			Event e = {};
+			e.type = Event::kPolyPressureEvent;
+			e.polyPressure.channel = channel;
+			e.polyPressure.pitch = note;
+			e.polyPressure.pressure = data / 127.f;
 			e.sampleOffset = sampleOffset;
 			w.eventList.addEvent (e);
 		}
@@ -2347,6 +2444,10 @@ bool AUWrapper::handleMIDIEventPacket (UInt32 inOffsetSampleFrame, const MIDIEve
 				addParameterChange (pid, value);
 			}
 		}
+		void onMidi1ProgramChange (Group group, Channel channel, Program program) const override
+		{
+			onProgramChange (group, channel, 0, program, 0, 0);
+		}
 		void onControlChange (Group group, Channel channel, ControllerNumber controller,
 		                      Data32 data) const override
 		{
@@ -2365,6 +2466,21 @@ bool AUWrapper::handleMIDIEventPacket (UInt32 inOffsetSampleFrame, const MIDIEve
 				                         static_cast<float> (std::numeric_limits<Data32>::max ()));
 			}
 		}
+		void onMidi1ControlChange (Group group, Channel channel, ControllerNumber controller,
+		                           Data8 value) const override
+		{
+			if (!w.midiMappingCache.empty () && controller < ControllerNumbers::kCountCtrlNumber)
+			{
+				constexpr std::array ignored = {
+				    ControllerNumbers::kCtrlBankSelectMSB, ControllerNumbers::kCtrlDataEntryMSB,
+				    ControllerNumbers::kCtrlBankSelectLSB, ControllerNumbers::kCtrlDataEntryLSB,
+				    ControllerNumbers::kCtrlNRPNSelectLSB, ControllerNumbers::kCtrlNRPNSelectMSB,
+				    ControllerNumbers::kCtrlRPNSelectLSB,  ControllerNumbers::kCtrlRPNSelectMSB};
+				if (std::find (ignored.begin (), ignored.end (), controller) != ignored.end ())
+					return;
+				addControllerChange (group, channel, controller, value / 127.f);
+			}
+		}
 		void onPitchBend (Group group, Channel channel, Data32 data) const override
 		{
 			if (!w.midiMappingCache.empty ())
@@ -2372,6 +2488,16 @@ bool AUWrapper::handleMIDIEventPacket (UInt32 inOffsetSampleFrame, const MIDIEve
 				addControllerChange (group, channel, ControllerNumbers::kPitchBend,
 				                     data /
 				                         static_cast<float> (std::numeric_limits<Data32>::max ()));
+			}
+		}
+		void onMidi1PitchBend (Group group, Channel channel, Data8 valueLSB,
+		                       Data8 valueMSB) const override
+		{
+			if (!w.midiMappingCache.empty ())
+			{
+				const auto value14 = static_cast<uint16> (valueLSB | (valueMSB << 7));
+				addControllerChange (group, channel, ControllerNumbers::kPitchBend,
+				                     value14 / 16383.f);
 			}
 		}
 		void onChannelPressure (Group group, Channel channel, Data32 data) const override
@@ -2382,6 +2508,12 @@ bool AUWrapper::handleMIDIEventPacket (UInt32 inOffsetSampleFrame, const MIDIEve
 				                     data /
 				                         static_cast<float> (std::numeric_limits<Data32>::max ()));
 			}
+		}
+		void onMidi1ChannelPressure (Group group, Channel channel, Data8 pressure) const override
+		{
+			if (!w.midiMappingCache.empty ())
+				addControllerChange (group, channel, ControllerNumbers::kAfterTouch,
+				                     pressure / 127.f);
 		}
 
 		void addControllerChange (Group group, Channel channel, ControllerNumber ctrler,
@@ -2410,6 +2542,12 @@ bool AUWrapper::handleMIDIEventPacket (UInt32 inOffsetSampleFrame, const MIDIEve
 		}
 	};
 	UMPHandler handler (*this, inOffsetSampleFrame);
+	if (packet->protocol == MIDIProtocolID::kMIDIProtocol_1_0)
+	{
+		return UMP::parsePackets<UMP::ParseSections::ChannelVoice1> (packet->wordCount,
+		                                                             packet->words,
+		                                                             handler) == packet->wordCount;
+	}
 	return UMP::parsePackets<UMP::ParseSections::ChannelVoice2> (packet->wordCount, packet->words,
 	                                                             handler) == packet->wordCount;
 }
@@ -2418,7 +2556,8 @@ bool AUWrapper::handleMIDIEventPacket (UInt32 inOffsetSampleFrame, const MIDIEve
 OSStatus AUWrapper::MIDIEventList (UInt32 inOffsetSampleFrame,
                                    const struct MIDIEventList* eventList)
 {
-	if (eventList->protocol != MIDIProtocolID::kMIDIProtocol_2_0)
+	if (eventList->protocol != MIDIProtocolID::kMIDIProtocol_2_0 &&
+	    eventList->protocol != MIDIProtocolID::kMIDIProtocol_1_0)
 		return -1;
 	if (eventList->numPackets == 0)
 		return noErr;
@@ -2918,10 +3057,19 @@ AUWrapper::MIDIOutputCallbackHelper::MIDIOutputCallbackHelper ()
 {
 	mMIDIMessageList.reserve (16);
 	mMIDICallbackStruct.midiOutputCallback = NULL;
+#if AUSDK_MIDI2_AVAILABLE
+	mMIDIEventListCallback = nil;
+#endif
 }
 
 //------------------------------------------------------------------------
-AUWrapper::MIDIOutputCallbackHelper::~MIDIOutputCallbackHelper () = default;
+AUWrapper::MIDIOutputCallbackHelper::~MIDIOutputCallbackHelper ()
+{
+#if AUSDK_MIDI2_AVAILABLE
+	if (mMIDIEventListCallback != nil)
+		Block_release (mMIDIEventListCallback);
+#endif
+}
 
 //------------------------------------------------------------------------
 void AUWrapper::MIDIOutputCallbackHelper::setCallbackInfo (AUMIDIOutputCallback callback,
@@ -2930,6 +3078,17 @@ void AUWrapper::MIDIOutputCallbackHelper::setCallbackInfo (AUMIDIOutputCallback 
 	mMIDICallbackStruct.midiOutputCallback = callback;
 	mMIDICallbackStruct.userData = userData;
 }
+
+#if AUSDK_MIDI2_AVAILABLE
+//------------------------------------------------------------------------
+void AUWrapper::MIDIOutputCallbackHelper::setEventListCallback (AUMIDIEventListBlock callback)
+{
+	if (mMIDIEventListCallback != nil)
+		Block_release (mMIDIEventListCallback);
+	mMIDIEventListCallback =
+	    callback != nil ? (AUMIDIEventListBlock)Block_copy (callback) : nil;
+}
+#endif
 
 //------------------------------------------------------------------------
 void AUWrapper::MIDIOutputCallbackHelper::addEvent (UInt8 status, UInt8 channel, UInt8 data1,
@@ -2942,6 +3101,32 @@ void AUWrapper::MIDIOutputCallbackHelper::addEvent (UInt8 status, UInt8 channel,
 //------------------------------------------------------------------------
 void AUWrapper::MIDIOutputCallbackHelper::fireAtTimeStamp (const AudioTimeStamp& inTimeStamp)
 {
+#if AUSDK_MIDI2_AVAILABLE
+	if (!mMIDIMessageList.empty () && mMIDIEventListCallback != nil)
+	{
+		if (@available(macOS 12.0, *))
+		{
+			for (const auto& item : mMIDIMessageList)
+			{
+				struct MIDIEventList eventList = {};
+				MIDIEventPacket* packet = MIDIEventListInit (&eventList, kMIDIProtocol_1_0);
+				const UInt32 word = (static_cast<UInt32> (0x2u) << 28) |
+				                    (static_cast<UInt32> (0u) << 24) |
+				                    (static_cast<UInt32> (item.status) << 16) |
+				                    (static_cast<UInt32> (item.data1) << 8) |
+				                    static_cast<UInt32> (item.data2);
+				packet = MIDIEventListAdd (&eventList, sizeof (eventList.packet), packet,
+				                           item.startFrame, 1, &word);
+				if (packet != nullptr)
+					mMIDIEventListCallback (static_cast<AUEventSampleTime> (inTimeStamp.mSampleTime), 0,
+					                        &eventList);
+			}
+			mMIDIMessageList.clear ();
+			return;
+		}
+	}
+#endif
+
 	if (!mMIDIMessageList.empty () && mMIDICallbackStruct.midiOutputCallback != nullptr)
 	{
 		auto callMidiOutputCallback = [&] (MIDIPacketList* pktlist) {
