@@ -109,6 +109,23 @@ constexpr auto architectureString = "x86-win";
 
 #endif // SMTG_PLATFORM_64
 
+std::wstring nativeLibraryPath (filesystem::path path)
+{
+	path.make_preferred ();
+	auto native = path.native ();
+	if (!path.is_absolute () ||
+	    native.compare (0, 4, L"\\\\?\\") == 0 || native.compare (0, 4, L"\\\\.\\") == 0)
+		return native;
+#if USE_FILESYSTEM
+	path = path.lexically_normal ();
+	path.make_preferred ();
+	native = path.native ();
+#endif
+	if (native.compare (0, 2, L"\\\\") == 0)
+		return L"\\\\?\\UNC\\" + native.substr (2);
+	return L"\\\\?\\" + native;
+}
+
 #if USE_OLE
 //------------------------------------------------------------------------
 struct Ole
@@ -155,13 +172,13 @@ public:
 	{
 		namespace StringConvert = Steinberg::Vst::StringConvert;
 
-		filesystem::path p (inPath);
+		filesystem::path p (StringConvert::convert (inPath));
 
 		auto filename = p.filename ();
 		p /= "Contents";
 		p /= archString;
 		p /= filename;
-		const std::wstring wString = p.generic_wstring ();
+		const auto wString = nativeLibraryPath (p);
 		HINSTANCE instance = LoadLibraryW (reinterpret_cast<LPCWSTR> (wString.data ()));
 #if SMTG_CPU_ARM_64EC
 		if (instance == nullptr)
@@ -170,7 +187,7 @@ public:
 			instance = loadAsPackage (inPath, errorDescription, architectureX64String);
 #endif // SMTG_CPU_ARM_64EC
 		if (instance == nullptr)
-			getLastError (p.string (), errorDescription);
+			getLastError (StringConvert::convert (p.generic_u16string ()), errorDescription);
 		return instance;
 	}
 
@@ -179,7 +196,7 @@ public:
 	{
 		namespace StringConvert = Steinberg::Vst::StringConvert;
 
-		auto wideStr = StringConvert::convert (inPath);
+		const auto wideStr = nativeLibraryPath (filesystem::path (StringConvert::convert (inPath)));
 		HINSTANCE instance = LoadLibraryW (reinterpret_cast<LPCWSTR> (wideStr.data ()));
 		if (instance == nullptr)
 		{
@@ -195,14 +212,9 @@ public:
 	//--- -----------------------------------------------------------------------
 	bool load (const std::string& inPath, std::string& errorDescription) override
 	{
-		// filesystem::u8path is deprecated in C++20
-#if SMTG_CPP20
-		const filesystem::path tmp (inPath);
-#else
-		const filesystem::path tmp = filesystem::u8path (inPath);
-#endif // SMTG_CPP20
+		const filesystem::path tmp (Steinberg::Vst::StringConvert::convert (inPath));
 		std::error_code ec;
-		if (filesystem::is_directory (tmp, ec))
+		if (filesystem::is_directory (filesystem::path (nativeLibraryPath (tmp)), ec))
 		{
 			// try as package (bundle)
 			mModule = loadAsPackage (inPath, errorDescription);
