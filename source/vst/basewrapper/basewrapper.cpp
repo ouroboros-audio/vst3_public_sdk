@@ -606,7 +606,10 @@ bool BaseWrapper::setupProcessing (int32 processModeOverwrite)
 	setup.sampleRate = mSampleRate;
 	setup.symbolicSampleSize = mVst3SampleSize;
 
-	return mProcessor->setupProcessing (setup) == kResultTrue;
+	if (mProcessor->setupProcessing (setup) != kResultTrue)
+		return false;
+	mProcessData.processMode = setup.processMode;
+	return true;
 }
 
 //------------------------------------------------------------------------

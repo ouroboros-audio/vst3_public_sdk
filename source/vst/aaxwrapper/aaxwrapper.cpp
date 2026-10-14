@@ -114,6 +114,8 @@ AAXWrapper::AAXWrapper (BaseWrapper::SVST3Config& config, AAXWrapper_Parameters*
 {
 	HLOG (HAPI, "%s", __FUNCTION__);
 
+    latencyConfiguration = U::cast<ILatencyConfiguration> (mProcessor);
+    if (latencyConfiguration) latencyConfiguration->setHostManagedLatency (true);
 	mBlockSize = 1024; // never explicitly changed by Pro Tools, so assume the maximum
 	mUseExportedBypass = true;
 	mUseIncIndex = false;
@@ -583,33 +585,7 @@ void AAXWrapper::onTimer (Timer* timer)
 	if (pendingMultiMonoLinkUp != Steinberg::Vst::kNoParamId)
 		endMultiMonoLink (pendingMultiMonoLinkUp);
 
-	// Pro Tools can miss (or delay) VST3 kLatencyChanged restarts. Poll the wrapped processor's
-	// latency here (main thread) and translate any changes into an AAX SetSignalLatency call.
-	if (mProcessor)
-	{
-		const Steinberg::int32 currentLatency =
-		    static_cast<Steinberg::int32> (mProcessor->getLatencySamples ());
-		const Steinberg::int32 prevLatency =
-		    lastObservedSignalLatency.exchange (currentLatency, std::memory_order_relaxed);
-		if (currentLatency >= 0 && currentLatency != prevLatency)
-			pendingSignalLatency.store (currentLatency, std::memory_order_relaxed);
-	}
-
-	const Steinberg::int32 pendingLatency =
-	    pendingSignalLatency.exchange (-1, std::memory_order_relaxed);
-	if (pendingLatency >= 0)
-	{
-		AAX_IController* ctrler = mAAXParams ? mAAXParams->Controller () : nullptr;
-		if (ctrler)
-		{
-			const int32_t aaxResult = ctrler->SetSignalLatency (static_cast<int32_t> (pendingLatency));
-			(void)aaxResult;
-		}
-		else
-		{
-			pendingSignalLatency.store (pendingLatency, std::memory_order_relaxed);
-		}
-	}
+    serviceLatencyChange ();
 
 	if (mWantsSetChunk && !mSettingChunk)
 	{
@@ -1012,24 +988,56 @@ void AAXWrapper::setSideChainEnable (bool enable)
 //-----------------------------------------------------------------------------
 void AAXWrapper::setRenderingOffline (bool val)
 {
-	if (val)
-	{
-		if (mVst3processMode == kOffline)
-			return;
-		mVst3processMode = kOffline;
-	}
-	else
-	{
-		if (mVst3processMode == kRealtime)
-			return;
-		mVst3processMode = kRealtime;
-	}
-	bool callStartStop = mProcessing;
-	if (callStartStop)
-		BaseWrapper::_stopProcess ();
-	setupProcessing ();
-	if (callStartStop)
-		BaseWrapper::_startProcess ();
+    const auto mode = val ? kOffline : kRealtime;
+    {
+        ProcessGate::Suspension suspended (processGate);
+        if (mode != mVst3processMode) {
+            if (latencyConfiguration) {
+                if (latencyConfiguration->setProcessingModePreservingLatency (mode) != kResultTrue) return;
+                mVst3processMode = mode;
+                mProcessData.processMode = mode;
+            } else {
+                const bool wasActive = mActive, wasProcessing = mProcessing;
+                BaseWrapper::_suspend ();
+                mVst3processMode = mode;
+                if (setupProcessing ()) {
+                    if (wasActive) BaseWrapper::_resume ();
+                    if (wasProcessing) BaseWrapper::_startProcess ();
+                }
+            }
+        }
+    }
+    serviceLatencyChange ();
+}
+
+bool AAXWrapper::applyLatencyConfiguration (Steinberg::uint64 id)
+{
+    ProcessGate::Suspension suspended (processGate);
+    return !id || (latencyConfiguration &&
+        latencyConfiguration->applyLatencyConfiguration (id, mVst3processMode) == kResultTrue);
+}
+
+void AAXWrapper::acknowledgeLatency (Steinberg::uint32 samples)
+{
+    latencyTransaction.acknowledge (samples, [this] (auto id) { return applyLatencyConfiguration (id); });
+}
+
+void AAXWrapper::serviceLatencyChange ()
+{
+    latencyTransaction.service (
+        [this] (LatencyConfiguration& configuration) {
+            ProcessGate::Reader processing (processGate);
+            if (!processing || !mProcessor) return false;
+            if (latencyConfiguration)
+                return latencyConfiguration->captureLatencyConfiguration (mVst3processMode, configuration) == kResultTrue;
+            configuration.samples = mProcessor->getLatencySamples ();
+            return true;
+        },
+        [this] (auto id) { return applyLatencyConfiguration (id); },
+        [this] (auto samples) {
+            auto* controller = mAAXParams ? mAAXParams->Controller () : nullptr;
+            return controller && controller->SetSignalLatency (static_cast<int32_t> (samples)) == AAX_SUCCESS;
+        });
 }
 
 //------------------------------------------------------------------------
@@ -1086,6 +1094,14 @@ Steinberg::int32 AAXWrapper::ResetFieldData (Steinberg::int32 index, void* inDat
 //------------------------------------------------------------------------
 Steinberg::int32 AAXWrapper::Process (AAXWrapper_Context* instance)
 {
+    ProcessGate::Reader processing (processGate);
+    if (!processing) {
+        const int32_t frames = *static_cast<int32_t*> (instance->ptr[idxBufferSize]);
+        auto** outputs = idxOutputChannels >= 0 ? static_cast<float**> (instance->ptr[idxOutputChannels]) : nullptr;
+        if (outputs && frames > 0) for (uint32 c = 0; c < mAAXOutputs; ++c)
+            if (outputs[c]) std::memset (outputs[c], 0, static_cast<size_t> (frames) * sizeof (float));
+        return AAX_SUCCESS;
+    }
 	//--- ------ Retrieve instance-specific information ---------
 	// Memory blocks
 	const int32_t bufferSize = *static_cast<int32_t*> (instance->ptr[idxBufferSize]);
@@ -1374,36 +1390,13 @@ void AAXWrapper::processOutputParametersChanges ()
 //-----------------------------------------------------------------------------
 Steinberg::tresult PLUGIN_API AAXWrapper::restartComponent (Steinberg::int32 flags)
 {
-	const bool onMainThread = (mainThread == getCurrentThread ());
-
-	tresult result = BaseWrapper::restartComponent (flags);
-
-	//--- ----------------------
-	if (flags & kLatencyChanged)
-	{
-		const Steinberg::int32 latency =
-		    mProcessor ? static_cast<Steinberg::int32> (mProcessor->getLatencySamples ()) : 0;
-		pendingSignalLatency.store (latency, std::memory_order_relaxed);
-
-		// Pro Tools appears to ignore latency changes if SetSignalLatency is called off the main
-		// thread. We always defer to onTimer (main thread), and also apply immediately when safe.
-		if (onMainThread)
-		{
-			const Steinberg::int32 pending = pendingSignalLatency.exchange (-1, std::memory_order_relaxed);
-			AAX_IController* ctrler = mAAXParams ? mAAXParams->Controller () : nullptr;
-			if (ctrler)
-			{
-				const int32_t aaxResult = ctrler->SetSignalLatency (static_cast<int32_t> (pending));
-				(void)aaxResult;
-			}
-			else
-			{
-				pendingSignalLatency.store (pending, std::memory_order_relaxed);
-			}
-		}
-		result = kResultTrue;
-	}
-	return result;
+    const auto result = BaseWrapper::restartComponent (flags & ~kLatencyChanged);
+    if (flags & kLatencyChanged) {
+        // The control timer captures the requested configuration and obtains
+        // host approval before changing the engine's queue delay.
+        return kResultTrue;
+    }
+    return result;
 }
 
 //------------------------------------------------------------------------

@@ -17,6 +17,8 @@
 /// \cond ignore
 
 #pragma once
+#include "public.sdk/source/vst/basewrapper/processgate.h"
+#include "public.sdk/source/vst/basewrapper/latencytransaction.h"
 
 #include "public.sdk/source/vst/basewrapper/basewrapper.h"
 #include "base/thread/include/flock.h"
@@ -123,6 +125,12 @@ public:
 
 //------------------------------------------------------------------------
 private:
+    Steinberg::Vst::ProcessGate processGate;
+    Steinberg::IPtr<Steinberg::Vst::ILatencyConfiguration> latencyConfiguration;
+    Steinberg::Vst::LatencyTransaction latencyTransaction;
+    void serviceLatencyChange ();
+    void acknowledgeLatency (Steinberg::uint32 samples);
+    bool applyLatencyConfiguration (Steinberg::uint64 id);
 	void processOutputParametersChanges () SMTG_OVERRIDE;
 	void processOutputEvents () SMTG_OVERRIDE;
 	
@@ -182,13 +190,6 @@ private:
 	bool mPresetChanged = false;
 	bool mBypassBeforePresetChanged = false;
 	bool mWantsSetChunkIsPreset = false;
-
-	// Latency updates can be requested by the wrapped VST3 instance from a non-main thread.
-	// Pro Tools appears to require SetSignalLatency on the main thread, so we defer it to onTimer.
-	std::atomic<Steinberg::int32> pendingSignalLatency {-1};
-	// Cached last-seen latency from the wrapped VST3 instance so the wrapper can detect changes
-	// even if the host ignores/doesn't route kLatencyChanged restarts.
-	std::atomic<Steinberg::int32> lastObservedSignalLatency {-1};
 
 	std::atomic<Steinberg::Vst::ParamID> pendingAutomationMenuParamId {Steinberg::Vst::kNoParamId};
 	std::atomic<Steinberg::Vst::ParamID> pendingAutomationLaneParamId {Steinberg::Vst::kNoParamId};

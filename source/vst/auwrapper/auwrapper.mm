@@ -49,6 +49,7 @@ Things to do :
 
 #include <dlfcn.h>
 #include <algorithm>
+#include <pthread.h>
 #include <objc/runtime.h>
 
 #if !CA_USE_AUDIO_PLUGIN_ONLY && !defined(SMTG_AUWRAPPER_USES_AUSDK)
@@ -493,6 +494,7 @@ AUWrapper::AUWrapper (ComponentInstanceRecord* ci)
 		    kResultTrue)
 			return;
 		
+		parameterControl = U::cast<IMainThreadParameterControl> (audioProcessor);
 		auto component = U::cast<IComponent> (audioProcessor);
 
 		if (audioProcessor->queryInterface (IEditController::iid, (void**)&editController) !=
@@ -661,6 +663,7 @@ AUWrapper::~AUWrapper ()
 	}
 
 	clearParameterValueCache ();
+	parameterControl.reset ();
 
 	if (audioProcessor)
 	{
@@ -824,6 +827,8 @@ static SpeakerArrangement numChannelsToSpeakerArrangement (UInt32 numChannels)
 //------------------------------------------------------------------------
 ComponentResult AUWrapper::Initialize ()
 {
+    ProcessGate::Suspension suspended (processGate);
+    processingReady = false;
 	if (audioProcessor && editController)
 	{
 		// match speaker arrangement with AU stream format
@@ -879,14 +884,17 @@ ComponentResult AUWrapper::Initialize ()
 		ps.sampleRate = getSampleRate ();
 		ps.maxSamplesPerBlock = GetMaxFramesPerSlice ();
 		ps.symbolicSampleSize = kSample32;
-		ps.processMode = kRealtime;
-		audioProcessor->setupProcessing (ps);
+		ps.processMode = isOfflineRender ? kOffline : kRealtime;
+		if (audioProcessor->setupProcessing (ps) != kResultTrue) return kAudioUnitErr_FailedInitialization;
 
 		updateMidiMappingCache ();
 
-		component->setActive (true);
-
-		audioProcessor->setProcessing (true);
+        if (component->setActive (true) != kResultTrue) return kAudioUnitErr_FailedInitialization;
+        if (audioProcessor->setProcessing (true) != kResultTrue) {
+            component->setActive (false);
+            return kAudioUnitErr_FailedInitialization;
+        }
+        processingReady = true;
 
 		if (paramListenerRef == nullptr)
 		{
@@ -1010,6 +1018,8 @@ ComponentResult AUWrapper::Initialize ()
 //------------------------------------------------------------------------
 void AUWrapper::Cleanup ()
 {
+    ProcessGate::Suspension suspended (processGate);
+    processingReady = false;
 	if (audioProcessor)
 	{
 		audioProcessor->setProcessing (false);
@@ -1301,6 +1311,11 @@ ComponentResult AUWrapper::SetParameter (AudioUnitParameterID inID, AudioUnitSco
                                          AudioUnitParameterValue inValue,
                                          UInt32 inBufferOffsetInFrames)
 {
+	const auto result = AUWRAPPER_BASE_CLASS::SetParameter (inID, inScope, inElement, inValue,
+	                                                      inBufferOffsetInFrames);
+	if (result != noErr)
+		return result;
+
 	if (inScope == kAudioUnitScope_Global)
 	{
 		if (inID == factoryProgramChangedID)
@@ -1314,10 +1329,15 @@ ComponentResult AUWrapper::SetParameter (AudioUnitParameterID inID, AudioUnitSco
 			}
 		}
 
-		transferParamChanges.addChange (inID, inValue, inBufferOffsetInFrames);
+		// Only main-thread controls may take the state-publication path. Render
+		// remains the sole consumer for audio-thread or sample-offset automation.
+		const bool accepted = inElement == 0 && inBufferOffsetInFrames == 0 &&
+		    pthread_main_np () && parameterControl &&
+		    parameterControl->setParameterNormalizedControl (inID, inValue) == kResultTrue;
+		if (!accepted)
+			transferParamChanges.addChange (inID, inValue, inBufferOffsetInFrames);
 	}
-	return AUWRAPPER_BASE_CLASS::SetParameter (inID, inScope, inElement, inValue,
-	                                           inBufferOffsetInFrames);
+	return result;
 }
 
 //------------------------------------------------------------------------
@@ -1412,9 +1432,8 @@ ComponentResult AUWrapper::restoreState (CFPropertyListRef inData, bool fromProj
 		return kAudioUnitErr_InvalidPropertyValue;
 
 	ComponentResult result = noErr;
-
-	if (result == noErr && audioProcessor && editController &&
-	    CFGetTypeID (inData) == CFDictionaryGetTypeID ())
+	ProcessGate::Suspension suspended (processGate);
+	if (audioProcessor && editController)
 	{
 		// Note: the bypass state is not part of the AU state
 		bool wasBypassed = false;
@@ -1429,6 +1448,15 @@ ComponentResult AUWrapper::restoreState (CFPropertyListRef inData, bool fromProj
 		auto processLen = [processorData length];
 		if (processLen == 0)
 			return kAudioUnitErr_InvalidPropertyValue;
+
+		// Discard only transfers from before this preset. The component orders any
+		// already submitted engine work before its new state internally.
+		transferParamChanges.removeChanges ();
+		processParamChanges.clearQueue ();
+		outputParamTransfer.removeChanges ();
+		outputParamChanges.clearQueue ();
+		eventList.clear ();
+		outputEvents.clear ();
 
 		if (processorData)
 		{
@@ -1501,6 +1529,18 @@ OSStatus AUWrapper::NewFactoryPresetSet (const AUPreset& inNewFactoryPreset)
 ComponentResult AUWrapper::Render (AudioUnitRenderActionFlags& ioActionFlags,
                                    const AudioTimeStamp& inTimeStamp, UInt32 inNumberFrames)
 {
+    ProcessGate::Reader processing (processGate);
+    if (!processing || !processingReady) {
+        for (UInt32 bus = 0; bus < Outputs ().GetNumberOfElements (); ++bus) {
+            auto* output = GetOutput (bus);
+            output->PrepareBuffer (inNumberFrames);
+            auto& buffers = output->GetBufferList ();
+            for (UInt32 c = 0; c < buffers.mNumberBuffers; ++c)
+                if (buffers.mBuffers[c].mData) std::memset (buffers.mBuffers[c].mData, 0, buffers.mBuffers[c].mDataByteSize);
+        }
+        ioActionFlags |= kAudioUnitRenderAction_OutputIsSilence;
+        return noErr;
+    }
 #if !AUSDK_MIDI2_AVAILABLE
 	midiMappingTransfer.accessTransferObject_rt (
 	    [&] (auto& obj) { midiMappingCache = std::move (obj); });
@@ -1853,41 +1893,17 @@ ComponentResult AUWrapper::SetProperty (AudioUnitPropertyID inID, AudioUnitScope
 		}
 #endif
 		//--- -----------------------
-		case kAudioUnitProperty_OfflineRender:
-		{
-			if (inScope == kAudioUnitScope_Global)
-			{
-				bool offline = *((UInt32*)inData) != 0;
-
-				if(offline != isOfflineRender && audioProcessor != nullptr)
-				{
-					isOfflineRender = offline;
-					
-					auto component = U::cast<IComponent> (audioProcessor);
-					
-					if(IsInitialized())
-					{
-						audioProcessor->setProcessing (false);
-						component->setActive (false);
-					}
-					
-					ProcessSetup ps;
-					ps.sampleRate = getSampleRate ();
-					ps.maxSamplesPerBlock = GetMaxFramesPerSlice ();
-					ps.symbolicSampleSize = kSample32;
-					ps.processMode = isOfflineRender? kOffline : kRealtime;
-					audioProcessor->setupProcessing (ps);
-
-					if(IsInitialized())
-					{
-						component->setActive (true);
-						audioProcessor->setProcessing (true);
-					}
-				}
-				return noErr;
-			}
-			break;
-		}
+        case kAudioUnitProperty_OfflineRender:
+        {
+            if (inScope != kAudioUnitScope_Global || inElement != 0 || !inData || inDataSize != sizeof (UInt32))
+                return kAudioUnitErr_InvalidPropertyValue;
+            const bool offline = *static_cast<const UInt32*> (inData) != 0;
+            // Before initialization this is configuration only. Initialize must
+            // honor it before asking the processor for its first latency.
+            if (!restartProcessing (offline ? 1 : 0)) return kAudioUnitErr_FailedInitialization;
+            PropertyChanged (kAudioUnitProperty_Latency, kAudioUnitScope_Global, 0);
+            return noErr;
+        }
 	}
 	return AUWRAPPER_BASE_CLASS::SetProperty (inID, inScope, inElement, inData, inDataSize);
 }
@@ -1902,6 +1918,10 @@ bool AUWrapper::CanScheduleParameters () const
 ComponentResult AUWrapper::GetProperty (AudioUnitPropertyID inID, AudioUnitScope inScope,
                                         AudioUnitElement inElement, void* outData)
 {
+    if (inID == kAudioUnitProperty_OfflineRender && inScope == kAudioUnitScope_Global && inElement == 0) {
+        *static_cast<UInt32*> (outData) = isOfflineRender ? 1u : 0u;
+        return noErr;
+    }
 	switch (inID)
 	{
 		//--- -----------------------
@@ -2650,17 +2670,13 @@ tresult PLUGIN_API AUWrapper::restartComponent (int32 flags)
 		PropertyChanged (kAudioUnitProperty_ParameterList, kAudioUnitScope_Global, 0);
 	}
 
-	if (flags & kLatencyChanged)
-	{
-		AudioUnitEvent auEvent;
-		auEvent.mArgument.mProperty.mAudioUnit = GetComponentInstance ();
-		auEvent.mArgument.mProperty.mPropertyID = kAudioUnitProperty_Latency;
-		auEvent.mArgument.mProperty.mScope = kAudioUnitScope_Global;
-		auEvent.mArgument.mProperty.mElement = 0;
-		auEvent.mEventType = kAudioUnitEvent_PropertyChange;
-		AUEventListenerNotify (paramListenerRef, NULL, &auEvent);
-		result = kResultTrue;
-	}
+    if (flags & kLatencyChanged)
+    {
+        // The VST3 processor commits a new queue only while deactivated.
+        // Service this on the control timer, outside the notification callback.
+        processingRestartPending.store (true, std::memory_order_release);
+        result = kResultTrue;
+    }
 	// TODO: finish restartComponent implementation
 	return result;
 }
@@ -2848,8 +2864,34 @@ void AUWrapper::updateProcessContext ()
 }
 
 //------------------------------------------------------------------------
+bool AUWrapper::restartProcessing (int offlineMode)
+{
+    ProcessGate::Suspension suspended (processGate);
+    if (offlineMode >= 0) {
+        if (isOfflineRender == (offlineMode != 0)) return true;
+        isOfflineRender = offlineMode != 0;
+    }
+    if (!IsInitialized () || !audioProcessor) return true;
+    processingReady = false;
+    auto component = U::cast<IComponent> (audioProcessor);
+    if (!component) return false;
+    audioProcessor->setProcessing (false);
+    component->setActive (false);
+    ProcessSetup setup{isOfflineRender ? kOffline : kRealtime, kSample32,
+                       static_cast<int32> (GetMaxFramesPerSlice ()), getSampleRate ()};
+    if (audioProcessor->setupProcessing (setup) != kResultTrue || component->setActive (true) != kResultTrue)
+        return false;
+    processingReady = audioProcessor->setProcessing (true) == kResultTrue;
+    return processingReady;
+}
+
 void AUWrapper::onTimer (Timer* timer)
 {
+    if (processingRestartPending.exchange (false, std::memory_order_acq_rel)) {
+        if (restartProcessing ()) PropertyChanged (kAudioUnitProperty_Latency, kAudioUnitScope_Global, 0);
+    }
+    ProcessGate::Reader processing (processGate);
+    if (!processing) return;
 	ParamID pid;
 	ParamValue value;
 	int32 sampleOffset;
@@ -2864,19 +2906,8 @@ void AUWrapper::onTimer (Timer* timer)
 		AUParameterListenerNotify (paramListenerRef, nullptr, &auParam);
 		editController->setParamNormalized (pid, value);
 	}
-	if (isBypassed)
-	{
-		ProcessData bypassData = processData;
-		bypassData.numSamples = 0;
-		processParamChanges.clearQueue ();
-		transferParamChanges.transferChangesTo (processParamChanges);
-		if (processParamChanges.getParameterCount () > 0)
-		{
-			audioProcessor->process (bypassData);
-			outputParamTransfer.transferChangesFrom (outputParamChanges);
-			outputParamChanges.clearQueue ();
-		}
-	}
+	// Render also runs while bypassed. It alone consumes parameter transfers;
+	// the timer must never become a second producer of queued engine work.
 	if (midiLearn)
 	{
 		MidiLearnEvent event;

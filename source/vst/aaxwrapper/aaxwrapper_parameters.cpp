@@ -116,9 +116,7 @@ AAX_Result AAXWrapper_Parameters::EffectInit ()
 		AAX_CSampleRate sampleRate;
 		if (ctrl->GetSampleRate (&sampleRate) == AAX_SUCCESS)
 			mWrapper->_setSampleRate (sampleRate);
-		if (mWrapper->mProcessor)
-			ctrl->SetSignalLatency (
-			    static_cast<int32> (mWrapper->mProcessor->getLatencySamples ()));
+        mWrapper->serviceLatencyChange ();
 	}
 
 	for (uint32 i = 0; i < static_cast<uint32> (mWrapper->mNumParams); i++)
@@ -763,19 +761,17 @@ AAX_Result AAXWrapper_Parameters::NotificationReceived (AAX_CTypeID iNotificatio
 		//--- The host has changed its latency compensation for this plug-in instance.
 		case AAX_eNotificationEvent_SignalLatencyChanged:
 		{
-			int32_t outSample;
-			Controller ()->GetSignalLatency (&outSample);
-
-			if (mPluginDesc)
-				mPluginDesc->mLatency = static_cast<uint32> (outSample);
-
-			if (mWrapper->isActive ())
-			{
-				mWrapper->_suspend ();
-				mWrapper->_resume ();
-			}
+            int32_t samples = 0;
+            if (Controller () && Controller ()->GetSignalLatency (&samples) == AAX_SUCCESS && samples >= 0)
+                mWrapper->acknowledgeLatency (static_cast<uint32> (samples));
 			break;
 		}
+        case AAX_eNotificationEvent_DelayCompensationState:
+        {
+            if (iNotificationData && iNotificationDataSize == sizeof (int32_t))
+                mWrapper->latencyTransaction.setCompensationEnabled (*static_cast<const int32_t*> (iNotificationData) != 0);
+            break;
+        }
 		//--- Tell the plug-in that chunk data is coming from a TFX
 		case AAX_eNotificationEvent_PresetOpened:
 		{

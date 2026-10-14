@@ -16,6 +16,8 @@
 /// \cond ignore
 
 #pragma once
+#include "public.sdk/source/vst/basewrapper/processgate.h"
+#include "public.sdk/source/vst/basewrapper/mainthreadparametercontrol.h"
 
 #ifdef SMTG_AUWRAPPER_USES_AUSDK
 #if CA_USE_AUDIO_PLUGIN_ONLY
@@ -169,6 +171,11 @@ protected:
 	//---from ITimerCallback----------------------
 	void onTimer (Timer* timer) SMTG_OVERRIDE;
 
+    ProcessGate processGate;
+    std::atomic<bool> processingRestartPending{false};
+    bool processingReady = false;
+    bool restartProcessing (int offlineMode = -1);
+
 	// internal helpers
 	double getSampleRate () const { return sampleRate; }
 	void updateProcessContext ();
@@ -184,6 +191,7 @@ protected:
 	                          UInt32 numChanInfo) const;
 
 	IAudioProcessor* audioProcessor;
+	IPtr<IMainThreadParameterControl> parameterControl;
 	IEditController* editController;
 
 	Timer* timer;
